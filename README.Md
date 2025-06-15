@@ -37,8 +37,8 @@ Unlike `libpaho-mqtt3c`'s 20-step build process, **BareMQ** is a breeze.
 ### Installation
 1. Clone the repo:
    ```bash
-   git clone https://github.com/yourusername/baremq.git
-   cd baremq
+   git clone https://github.com/AnonMoon64/BareMQ.git
+   cd BareMQ
    ```
 2. Copy `include/baremq.h` and `src/baremq.c` to your project. Done.
 
