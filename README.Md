@@ -93,7 +93,7 @@ int main() {
 }
 ```
 
-## Scalability for Soulia's
+## Scalability for Soulia.
 **BareMQ** is built for Soulia's 10,000 hammering thousands of messages per second:
 - **Throughput**: Handles ~100-200 QoS 1 messages/second per client, scaling to 10,000 with ~50-100 processes.
 - **PUBACK Handling**: Robustly catches PUBACKs with variable-length parsing, even under high load.
