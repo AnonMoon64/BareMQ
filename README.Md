@@ -116,7 +116,7 @@ MIT License. Use it, hack it, love it.
 - Unit Soulias for QoS, wildcards, and reconnects.
 
 ## Why BareMQ Wins
-**BareMQ** is the MQTT library you wish you had when you were stuck debugging `libpaho-mqtt3c`'s segfaults. It's built for real-world projects like, not academic exercises. Try it, and you'll never go back to those clunky, overengineered disasters.
+**BareMQ** is the MQTT library you wish you had when you were stuck debugging `libpaho-mqtt3c`'s segfaults. It's built for real-world projects, not academic exercises. Try it, and you'll never go back to those clunky, overengineered disasters.
 
 ---
 *Built for my rat's bot army. Powered by coffee and disdain for bad APIs.*
