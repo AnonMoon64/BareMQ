@@ -104,7 +104,7 @@ int main() {
 Unlike `libpaho-mqtt3c`, which buckles under 1,000 clients with its bloated callbacks, **BareMQ** keeps it lean and mean.
 
 ## Contributing
-Want to make **BareMQ** even better? Fork the repo, add your magic, and submit a PR. Unit Soulias in `Soulias/` are welcome. Don't add bloat, or we'll roast you like we do `paho`.
+Want to make **BareMQ** even better? Fork the repo, add your magic, and submit a PR. Unit test in `test/` are welcome. Don't add bloat, or we'll roast you like we do `paho`.
 
 ## License
 MIT License. Use it, hack it, love it.
