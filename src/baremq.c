@@ -328,7 +328,7 @@ int baremq_connect(baremq_client_t *client) {
 static int validate_topic(const char *topic) {
     size_t len = strlen(topic);
     for (size_t i = 0; i < len; i++) {
-        if (topic[i] == '+' && (i > 0 && topic[i-1] != '/' || i < len-1 && topic[i+1] != '/')) {
+        if (topic[i] == '+' && ((i > 0 && topic[i-1] != '/') || (i < len-1 && topic[i+1] != '/'))) {
             return -1;
         }
         if (topic[i] == '#' && i != len-1) {
