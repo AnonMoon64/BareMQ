@@ -1,6 +1,11 @@
 #ifndef BAREMQ_H
 #define BAREMQ_H
 #include <stdint.h>
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 typedef struct baremq_client baremq_client_t;
 
@@ -33,5 +38,13 @@ int baremq_disconnect(baremq_client_t *client);
 
 // Get last error message
 const char *baremq_get_error(baremq_client_t *client);
+
+// Server API: start IOCP-based server (port, max connections, per-connection buffer size)
+int baremq_server_start_iocp(uint16_t port, size_t max_connections, size_t per_conn_buf);
+void baremq_server_stop_iocp(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
