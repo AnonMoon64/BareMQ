@@ -1,30 +1,22 @@
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
 #include "baremq.h"
+#ifdef _MSC_VER
+#define strdup _strdup
+#define snprintf _snprintf
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-
-#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <conio.h>
-#define CLOSE_SOCKET closesocket
-#define SLEEP(ms) Sleep(ms)
-#else
-#include <sys/socket.h>
-#include <netdb.h>
-#include <unistd.h>
-#include <sys/select.h>
-#include <termios.h>
-#include <fcntl.h>
-#include <errno.h>
-#define CLOSE_SOCKET close
-#define SLEEP(ms) usleep((ms) * 1000)
-#define SOCKET int
-#define INVALID_SOCKET -1
-#define SOCKET_ERROR -1
-#define WSAGetLastError() errno
-#endif
+#include <windows.h>
+#include <stdarg.h>
+
+#define MAX_EVENTS 10000
+#define BUFFER_SIZE 4096
 
 // MQTT packet types
 #define MQTT_CONNECT 1
@@ -33,11 +25,15 @@
 #define MQTT_PUBACK 4
 #define MQTT_SUBSCRIBE 8
 #define MQTT_SUBACK 9
+
+// --- Lightweight IOCP-based acceptor and buffer pool (scalable path) ---
+#include <mswsock.h>
+
 #define MQTT_PINGREQ 12
 #define MQTT_PINGRESP 13
+
 #define MQTT_DISCONNECT 14
 
-#define MAX_PACKET_IDS 1024 // Pool size for packet IDs
 
 // Internal client struct
 struct baremq_client {
@@ -47,45 +43,647 @@ struct baremq_client {
     char *client_id;
     char *username;
     char *password;
+
     uint16_t keep_alive;
     uint32_t last_ping;
-    size_t max_buffer_size;
     char last_error[256];
-    uint16_t packet_id_pool[MAX_PACKET_IDS];
-    uint16_t next_packet_id_idx;
-    uint16_t pending_pubacks[MAX_PACKET_IDS];
-    size_t num_pending_pubacks;
+    HANDLE iocp;
+    size_t max_buffer_size;
+    // receive buffer for assembling MQTT packets
+
+    uint8_t *recv_buf;
+    size_t recv_capacity;
+    size_t recv_len;
+    // user callback for incoming publishes
+    void (*message_cb)(const char *topic, const char *message, size_t message_len);
+    // packet id management and pending ack handles (indexed by packet id)
+
+    HANDLE *pending_acks; // array size 65536
+    uint16_t next_packet_id;
+    CRITICAL_SECTION ack_lock;
+    CRITICAL_SECTION recv_lock;
 };
 
-// Decode MQTT remaining length (1-4 bytes)
-static int decode_remaining_length(uint8_t *buffer, size_t *length, size_t *bytes_read, size_t available_bytes) {
+/* Global listen socket used by the server acceptor. Some functions in
+    this file reference `g_listen_socket` while others reference
+    `server_listen_sock`. Define this symbol and initialize to
+    INVALID_SOCKET. */
+static SOCKET g_listen_socket = INVALID_SOCKET;
+
+/* Forward declaration to avoid implicit declaration warnings when
+    `baremq_event_loop` is referenced before its definition. */
+void baremq_event_loop(baremq_client_t *client);
+
+
+// Decode MQTT Remaining Length. `data` points at the first length byte (i.e., byte 1 of header).
+// `available` is how many bytes are available to read from `data` (not including fixed header byte0).
+// Returns: on success, writes *out_len and *out_len_bytes and returns 0. If more bytes are needed, returns 1.
+static int decode_remaining_length(const uint8_t *data, size_t available, size_t *out_len, int *out_len_bytes) {
     size_t multiplier = 1;
     size_t value = 0;
-    size_t read = 0;
-    uint8_t encoded_byte;
+    int i = 0;
+    for (i = 0; i < 4; ++i) {
+        if ((size_t)i >= available) return 1; // need more bytes
+        uint8_t encoded = data[i];
+        value += (encoded & 127) * multiplier;
+        if ((encoded & 128) == 0) {
+            *out_len = value;
+            *out_len_bytes = i + 1;
 
-    do {
-        if (read >= available_bytes || read >= 4) return -1; // Max 4 bytes or buffer limit
-        encoded_byte = buffer[read++];
-        value += (encoded_byte & 0x7F) * multiplier;
+            return 0;
+        }
         multiplier *= 128;
-    } while (encoded_byte & 0x80);
+    }
+    return -1; // malformed (length too long)
+}
 
-    *length = value;
-    *bytes_read = read;
+// ----------------- Server IOCP acceptor (per-operation model) -----------------
+
+// Per-connection context for accepted sockets
+// Minimal buffer pool structure
+typedef struct BufferPool {
+    char *pool;
+    size_t buf_size;
+    size_t count;
+    size_t *free_stack;
+    size_t free_top;
+    CRITICAL_SECTION lock;
+} BufferPool;
+
+// Accept context for posting AcceptEx
+typedef struct AcceptCtx {
+    OVERLAPPED overlapped;
+    SOCKET listen_sock;
+    SOCKET accept_sock;
+    char addrbuf[(sizeof(struct sockaddr_in6) + 16) * 2];
+} AcceptCtx;
+
+// Buffer pool helpers
+static BufferPool *buffer_pool_create(size_t buf_size, size_t count) {
+    BufferPool *bp = (BufferPool *)malloc(sizeof(BufferPool));
+    if (!bp) return NULL;
+    bp->buf_size = buf_size;
+    bp->count = count;
+    bp->pool = (char *)HeapAlloc(GetProcessHeap(), 0, buf_size * count);
+    if (!bp->pool) { free(bp); return NULL; }
+    bp->free_stack = (size_t *)malloc(sizeof(size_t) * count);
+    if (!bp->free_stack) { HeapFree(GetProcessHeap(), 0, bp->pool); free(bp); return NULL; }
+    for (size_t i = 0; i < count; ++i) bp->free_stack[i] = count - 1 - i;
+    bp->free_top = count;
+    InitializeCriticalSection(&bp->lock);
+    return bp;
+}
+
+static void buffer_pool_destroy(BufferPool *bp) {
+    if (!bp) return;
+    DeleteCriticalSection(&bp->lock);
+    HeapFree(GetProcessHeap(), 0, bp->pool);
+    free(bp->free_stack);
+    free(bp);
+}
+
+static ssize_t buffer_pool_acquire(BufferPool *bp) {
+    ssize_t idx = -1;
+    EnterCriticalSection(&bp->lock);
+    if (bp->free_top > 0) idx = (ssize_t)bp->free_stack[--bp->free_top];
+    LeaveCriticalSection(&bp->lock);
+    return idx;
+}
+
+static void buffer_pool_release(BufferPool *bp, ssize_t idx) {
+    if (idx < 0) return;
+    EnterCriticalSection(&bp->lock);
+    bp->free_stack[bp->free_top++] = (size_t)idx;
+    LeaveCriticalSection(&bp->lock);
+}
+
+// create listen socket helper
+static int create_listen_socket(uint16_t port) {
+    SOCKET s = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
+    if (s == INVALID_SOCKET) return -1;
+    BOOL opt = TRUE;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_ANY);
+    sa.sin_port = htons(port);
+    if (bind(s, (struct sockaddr *)&sa, sizeof(sa)) == SOCKET_ERROR) { closesocket(s); return -1; }
+    if (listen(s, SOMAXCONN) == SOCKET_ERROR) { closesocket(s); return -1; }
+    g_listen_socket = s;
     return 0;
 }
 
-// Encode MQTT remaining length
-static int encode_remaining_length(uint8_t *buffer, size_t remaining_len) {
-    int pos = 0;
+static AcceptCtx *g_accept_ctxs = NULL;
+static size_t g_accept_ctx_count = 0;
+
+typedef struct server_conn {
+    SOCKET sock;
+    BufferPool *bp;
+    size_t buf_index;
+    CRITICAL_SECTION lock;
+    // user state pointer can be added here
+    // accumulation buffer for framing
+    uint8_t *accum;
+    size_t accum_len;
+    size_t accum_cap;
+} server_conn;
+
+typedef struct server_perio {
+    OVERLAPPED overlapped;
+    WSABUF buf;
+    size_t buf_index;
+    int op; // 0=recv,1=send
+} server_perio;
+
+static HANDLE server_iocp = NULL;
+static SOCKET server_listen_sock = INVALID_SOCKET;
+static BufferPool *server_bp = NULL;
+static LPFN_ACCEPTEX server_lpfnAcceptEx = NULL;
+static HANDLE *server_workers = NULL;
+static size_t server_worker_count = 0;
+
+// Utility: post an AcceptEx using an AcceptCtx-like overlapped stored in caller buffer
+static int server_post_accept(OVERLAPPED *ov, SOCKET *accept_sock, char *addrbuf, size_t addrbuflen) {
+    *accept_sock = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
+    if (*accept_sock == INVALID_SOCKET) return -1;
+    DWORD bytes = 0;
+    BOOL rc = server_lpfnAcceptEx(server_listen_sock, *accept_sock, addrbuf, 0,
+                                  sizeof(struct sockaddr_in) + 16,
+                                  sizeof(struct sockaddr_in) + 16,
+                                  &bytes, ov);
+    if (!rc) {
+        int err = WSAGetLastError();
+        if (err != ERROR_IO_PENDING) {
+            closesocket(*accept_sock);
+            *accept_sock = INVALID_SOCKET;
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static DWORD WINAPI server_iocp_worker(LPVOID lpParam) {
+    (void)lpParam;
+    DWORD bytes;
+    ULONG_PTR key;
+    LPOVERLAPPED overlapped;
+
+    while (1) {
+        BOOL ok = GetQueuedCompletionStatus(server_iocp, &bytes, &key, &overlapped, INFINITE);
+        if (!ok) {
+            if (!overlapped) continue;
+        }
+        if (!overlapped) continue;
+
+        // Distinguish AcceptEx completion: for AcceptEx we don't use a connection key, so key==0
+        // We can tell an AcceptEx by inspecting that overlapped comes from our addr buffer usage
+        // For simplicity assume overlapped is for accept when key == 0
+        if (key == 0) {
+            AcceptCtx *actx = (AcceptCtx *)overlapped;
+            SOCKET asock = actx->accept_sock;
+            if (asock == INVALID_SOCKET) {
+                // nothing to do
+            } else {
+                // update accept context
+                setsockopt(asock, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, (char *)&server_listen_sock, sizeof(server_listen_sock));
+
+                // create connection context
+                server_conn *conn = (server_conn *)malloc(sizeof(server_conn));
+                if (conn) {
+                    conn->sock = asock;
+                    conn->bp = server_bp;
+                    conn->buf_index = (size_t)-1;
+                    InitializeCriticalSection(&conn->lock);
+
+                    // associate accepted socket with IOCP, use conn pointer as completion key
+                    CreateIoCompletionPort((HANDLE)asock, server_iocp, (ULONG_PTR)conn, 0);
+
+                    // post initial WSARecv
+                    server_perio *pio = (server_perio *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(server_perio));
+                    if (pio) {
+                        // acquire one buffer for accumulation and one for the recv operation
+                        ssize_t accum_idx = buffer_pool_acquire(server_bp);
+                        ssize_t recv_idx = -1;
+                        if (accum_idx >= 0) recv_idx = buffer_pool_acquire(server_bp);
+                        if (accum_idx >= 0 && recv_idx >= 0) {
+                            // assign accumulation buffer to conn
+                            conn->buf_index = (size_t)accum_idx;
+                            conn->accum = (uint8_t *)(server_bp->pool + (accum_idx * server_bp->buf_size));
+                            conn->accum_cap = server_bp->buf_size;
+                            conn->accum_len = 0;
+
+                            // assign recv buffer to pio
+                            pio->buf_index = (size_t)recv_idx;
+                            pio->buf.buf = server_bp->pool + (recv_idx * server_bp->buf_size);
+                            pio->buf.len = (ULONG)server_bp->buf_size;
+                            pio->op = 0;
+                            ZeroMemory(&pio->overlapped, sizeof(OVERLAPPED));
+                            DWORD flags2 = 0;
+                            DWORD recvBytes = 0;
+                            int rr = WSARecv(asock, &pio->buf, 1, &recvBytes, &flags2, &pio->overlapped, NULL);
+                            if (rr == SOCKET_ERROR) {
+                                int we = WSAGetLastError();
+                                if (we != WSA_IO_PENDING) {
+                                    // release buffers and cleanup
+                                    buffer_pool_release(server_bp, recv_idx);
+                                    buffer_pool_release(server_bp, accum_idx);
+                                    HeapFree(GetProcessHeap(), 0, pio);
+                                    closesocket(asock);
+                                    DeleteCriticalSection(&conn->lock);
+                                    free(conn);
+                                }
+                            }
+                        } else {
+                            // not enough buffers available, cleanup
+                            if (recv_idx >= 0) buffer_pool_release(server_bp, recv_idx);
+                            if (accum_idx >= 0) buffer_pool_release(server_bp, accum_idx);
+                            HeapFree(GetProcessHeap(), 0, pio);
+                            closesocket(asock);
+                            DeleteCriticalSection(&conn->lock);
+                            free(conn);
+                        }
+                    }
+                } else {
+                    closesocket(asock);
+                }
+            }
+
+            // Re-post AcceptEx on this accept context
+            // create new accept socket and issue AcceptEx again
+            actx->accept_sock = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
+            ZeroMemory(&actx->overlapped, sizeof(OVERLAPPED));
+            DWORD out2 = 0;
+            BOOL rc2 = server_lpfnAcceptEx(server_listen_sock, actx->accept_sock, actx->addrbuf, 0,
+                                           sizeof(struct sockaddr_in) + 16, sizeof(struct sockaddr_in) + 16, &out2, &actx->overlapped);
+            if (!rc2) {
+                int err2 = WSAGetLastError();
+                if (err2 != ERROR_IO_PENDING) {
+                    if (actx->accept_sock != INVALID_SOCKET) closesocket(actx->accept_sock);
+                    actx->accept_sock = INVALID_SOCKET;
+                }
+            }
+
+            continue;
+        }
+
+        // Otherwise key is server_conn*
+        server_conn *conn = (server_conn *) (void *) key;
+        server_perio *pio = (server_perio *) overlapped;
+        if (bytes == 0) {
+            // connection closed
+            if (pio) {
+                if (pio->buf_index != (size_t)-1) buffer_pool_release(server_bp, pio->buf_index);
+                HeapFree(GetProcessHeap(), 0, pio);
+            }
+            EnterCriticalSection(&conn->lock);
+            closesocket(conn->sock);
+            LeaveCriticalSection(&conn->lock);
+            DeleteCriticalSection(&conn->lock);
+            if (conn->buf_index != (size_t)-1) buffer_pool_release(server_bp, conn->buf_index);
+            free(conn);
+            continue;
+        }
+
+        if (pio->op == 0) {
+            // Received data in pio->buf.buf (bytes bytes). Append to conn->accum and parse MQTT frames.
+            EnterCriticalSection(&conn->lock);
+            if (!conn->accum) {
+                // accumulation buffer should have been assigned from pool at accept; if missing, close connection
+                LeaveCriticalSection(&conn->lock);
+                if (pio->buf_index != (size_t)-1) buffer_pool_release(server_bp, pio->buf_index);
+                HeapFree(GetProcessHeap(), 0, pio);
+                EnterCriticalSection(&conn->lock);
+                closesocket(conn->sock);
+                LeaveCriticalSection(&conn->lock);
+                if (conn->buf_index != (size_t)-1) buffer_pool_release(server_bp, conn->buf_index);
+                DeleteCriticalSection(&conn->lock);
+                free(conn);
+                continue;
+            }
+            if (conn->accum_len + bytes > conn->accum_cap) {
+                // accumulation overflow—drop connection to avoid reallocations
+                LeaveCriticalSection(&conn->lock);
+                if (pio->buf_index != (size_t)-1) buffer_pool_release(server_bp, pio->buf_index);
+                HeapFree(GetProcessHeap(), 0, pio);
+                EnterCriticalSection(&conn->lock);
+                closesocket(conn->sock);
+                LeaveCriticalSection(&conn->lock);
+                if (conn->buf_index != (size_t)-1) buffer_pool_release(server_bp, conn->buf_index);
+                DeleteCriticalSection(&conn->lock);
+                free(conn);
+                continue;
+            }
+            memcpy(conn->accum + conn->accum_len, pio->buf.buf, bytes);
+            conn->accum_len += bytes;
+
+            // parse loop
+            while (1) {
+                if (conn->accum_len < 2) break;
+                size_t remaining_len = 0;
+                int rem_bytes = 0;
+                int dr = decode_remaining_length(conn->accum + 1, conn->accum_len - 1, &remaining_len, &rem_bytes);
+                if (dr == 1) break; // need more bytes
+                if (dr == -1) { /* malformed */ closesocket(conn->sock); break; }
+                size_t total = 1 + rem_bytes + remaining_len;
+                if (conn->accum_len < total) break;
+
+                uint8_t *pkt = conn->accum;
+                uint8_t pkt_type = pkt[0] >> 4;
+                size_t var_idx = 1 + rem_bytes;
+                if (pkt_type == MQTT_PUBLISH) {
+                    if (var_idx + 2 <= total) {
+                        uint16_t topic_len = (uint16_t)(pkt[var_idx] << 8) | pkt[var_idx+1];
+                        size_t idx = var_idx + 2;
+                        if (idx + topic_len <= total) {
+                            // extract topic
+                            char *topic = (char *)malloc(topic_len + 1);
+                            memcpy(topic, &pkt[idx], topic_len);
+                            topic[topic_len] = '\0';
+                            idx += topic_len;
+                            int qos = (pkt[0] >> 1) & 0x03;
+                            uint16_t pid = 0;
+                            if (qos > 0) {
+                                if (idx + 2 <= total) {
+                                    pid = (uint16_t)(pkt[idx] << 8) | pkt[idx+1];
+                                    idx += 2;
+                                }
+                            }
+                            size_t payload_len = total - idx;
+                            const char *payload = (const char *)&pkt[idx];
+                            // TODO: call higher-level handler; for now ignore payload
+                            // If QoS1, send PUBACK via overlapped WSASend
+                            if (qos == 1 && pid != 0) {
+                                server_perio *sp = (server_perio *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(server_perio));
+                                if (sp) {
+                                    sp->op = 1;
+                                    sp->buf_index = (size_t)-1;
+                                    sp->buf.len = 4;
+                                    sp->buf.buf = (char *)HeapAlloc(GetProcessHeap(), 0, 4);
+                                    if (sp->buf.buf) {
+                                        sp->buf.buf[0] = (MQTT_PUBACK << 4);
+                                        sp->buf.buf[1] = 2;
+                                        sp->buf.buf[2] = (uint8_t)((pid >> 8) & 0xFF);
+                                        sp->buf.buf[3] = (uint8_t)(pid & 0xFF);
+                                        DWORD sent = 0;
+                                        DWORD flags2 = 0;
+                                        int w = WSASend(conn->sock, &sp->buf, 1, &sent, flags2, &sp->overlapped, NULL);
+                                        if (w == SOCKET_ERROR) {
+                                            int we = WSAGetLastError();
+                                            if (we != WSA_IO_PENDING) {
+                                                buffer_pool_release(server_bp, sp->buf_index);
+                                                HeapFree(GetProcessHeap(), 0, sp->buf.buf);
+                                                HeapFree(GetProcessHeap(), 0, sp);
+                                            }
+                                        }
+                                    } else {
+                                        HeapFree(GetProcessHeap(), 0, sp);
+                                    }
+                                }
+                            }
+                            free(topic);
+                        }
+                    }
+                } else if (pkt_type == MQTT_PINGREQ) {
+                    // reply PINGRESP
+                    uint8_t resp[2] = { (MQTT_PINGRESP << 4), 0 };
+                    send(conn->sock, (char *)resp, 2, 0);
+                } else if (pkt_type == MQTT_SUBSCRIBE) {
+                    // For simplicity, accept subscribes with QoS0 granted
+                    // SUBSCRIBE has packet id in variable header
+                    if (var_idx + 2 <= total) {
+                        uint16_t spid = (uint16_t)(pkt[var_idx] << 8) | pkt[var_idx+1];
+                        // Build SUBACK with return code 0
+                        uint8_t suback[5];
+                        suback[0] = (MQTT_SUBACK << 4);
+                        suback[1] = 3; // remaining len
+                        suback[2] = (uint8_t)((spid >> 8) & 0xFF);
+                        suback[3] = (uint8_t)(spid & 0xFF);
+                        suback[4] = 0; // return QoS 0
+                        send(conn->sock, (char *)suback, 5, 0);
+                    }
+                }
+
+                // consume
+                size_t left = conn->accum_len - total;
+                if (left > 0) memmove(conn->accum, conn->accum + total, left);
+                conn->accum_len = left;
+            }
+
+            LeaveCriticalSection(&conn->lock);
+
+            // re-post recv
+            ZeroMemory(&pio->overlapped, sizeof(OVERLAPPED));
+            DWORD flags2 = 0;
+            DWORD recvBytes = 0;
+            int r = WSARecv(conn->sock, &pio->buf, 1, &recvBytes, &flags2, &pio->overlapped, NULL);
+            if (r == SOCKET_ERROR) {
+                int err = WSAGetLastError();
+                if (err != WSA_IO_PENDING) {
+                    if (pio->buf_index != (size_t)-1) buffer_pool_release(server_bp, pio->buf_index);
+                    HeapFree(GetProcessHeap(), 0, pio);
+                    EnterCriticalSection(&conn->lock);
+                    closesocket(conn->sock);
+                    LeaveCriticalSection(&conn->lock);
+                    DeleteCriticalSection(&conn->lock);
+                    if (conn->buf_index != (size_t)-1) buffer_pool_release(server_bp, conn->buf_index);
+                    free(conn);
+                }
+            }
+        } else {
+            // send completion
+            if (pio->buf_index != (size_t)-1) buffer_pool_release(server_bp, pio->buf_index);
+            if (pio->buf.buf) HeapFree(GetProcessHeap(), 0, pio->buf.buf);
+            HeapFree(GetProcessHeap(), 0, pio);
+        }
+    }
+    return 0;
+}
+
+// Start server: create IOCP, load AcceptEx, post initial AcceptEx contexts, spawn workers
+int baremq_server_start_iocp(uint16_t port, size_t max_connections, size_t per_conn_buf) {
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) return -1;
+    server_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+    if (!server_iocp) return -1;
+    server_bp = buffer_pool_create(per_conn_buf, max_connections);
+    if (!server_bp) return -1;
+     if (create_listen_socket(port) != 0) return -1;
+     /* Keep the older name in sync so other code paths that use
+         `server_listen_sock` will see the actual listen socket. */
+     server_listen_sock = g_listen_socket;
+     // load AcceptEx
+    DWORD bytes = 0;
+    GUID guid = WSAID_ACCEPTEX;
+    if (WSAIoctl(g_listen_socket, SIO_GET_EXTENSION_FUNCTION_POINTER, &guid, sizeof(guid), &server_lpfnAcceptEx, sizeof(server_lpfnAcceptEx), &bytes, NULL, NULL) == SOCKET_ERROR) return -1;
+
+    // associate listen socket with IOCP (use key NULL/0 for accept completions)
+    CreateIoCompletionPort((HANDLE)g_listen_socket, server_iocp, (ULONG_PTR)0, 0);
+
+    // post some AcceptEx contexts
+    size_t accept_post = max_connections < 512 ? max_connections : 512;
+    g_accept_ctx_count = accept_post;
+    g_accept_ctxs = (AcceptCtx *)malloc(sizeof(AcceptCtx) * accept_post);
+    memset(g_accept_ctxs, 0, sizeof(AcceptCtx) * accept_post);
+    for (size_t i = 0; i < accept_post; ++i) {
+        OverlappedZero:
+        ZeroMemory(&g_accept_ctxs[i].overlapped, sizeof(OVERLAPPED));
+        g_accept_ctxs[i].listen_sock = g_listen_socket;
+        g_accept_ctxs[i].accept_sock = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
+        if (g_accept_ctxs[i].accept_sock == INVALID_SOCKET) continue;
+        DWORD out = 0;
+        BOOL rc = server_lpfnAcceptEx(g_listen_socket, g_accept_ctxs[i].accept_sock, g_accept_ctxs[i].addrbuf, 0,
+                                      sizeof(struct sockaddr_in) + 16, sizeof(struct sockaddr_in) + 16, &out, &g_accept_ctxs[i].overlapped);
+        if (!rc) {
+            int err = WSAGetLastError();
+            if (err != ERROR_IO_PENDING) {
+                closesocket(g_accept_ctxs[i].accept_sock);
+                g_accept_ctxs[i].accept_sock = INVALID_SOCKET;
+                continue;
+            }
+        }
+    }
+
+    // spawn worker threads
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    server_worker_count = si.dwNumberOfProcessors * 2;
+    server_workers = (HANDLE *)malloc(sizeof(HANDLE) * server_worker_count);
+    for (size_t i = 0; i < server_worker_count; ++i) {
+        server_workers[i] = CreateThread(NULL, 0, server_iocp_worker, NULL, 0, NULL);
+    }
+
+    return 0;
+}
+
+// Stop server
+void baremq_server_stop_iocp() {
+    // TODO: gracefully stop posting accepts, close sockets, signal workers
+    if (server_workers) {
+        for (size_t i = 0; i < server_worker_count; ++i) {
+            PostQueuedCompletionStatus(server_iocp, 0, 0, NULL);
+        }
+        for (size_t i = 0; i < server_worker_count; ++i) if (server_workers[i]) WaitForSingleObject(server_workers[i], INFINITE);
+        free(server_workers); server_workers = NULL; server_worker_count = 0;
+    }
+    if (g_accept_ctxs) {
+        for (size_t i = 0; i < g_accept_ctx_count; ++i) if (g_accept_ctxs[i].accept_sock != INVALID_SOCKET) closesocket(g_accept_ctxs[i].accept_sock);
+        free(g_accept_ctxs); g_accept_ctxs = NULL; g_accept_ctx_count = 0;
+    }
+    if (server_bp) { buffer_pool_destroy(server_bp); server_bp = NULL; }
+    if (server_iocp) { CloseHandle(server_iocp); server_iocp = NULL; }
+    if (server_listen_sock != INVALID_SOCKET) { closesocket(server_listen_sock); server_listen_sock = INVALID_SOCKET; }
+    WSACleanup();
+}
+
+
+// Packet ID helpers
+static uint16_t get_next_packet_id(baremq_client_t *client) {
+    EnterCriticalSection(&client->ack_lock);
+    uint16_t id = client->next_packet_id++;
+    if (client->next_packet_id == 0) client->next_packet_id = 1; // skip 0
+    LeaveCriticalSection(&client->ack_lock);
+    return id;
+
+}
+
+static int wait_for_ack(baremq_client_t *client, uint16_t packet_id, uint32_t timeout_ms) {
+    if (packet_id == 0) return -1;
+    EnterCriticalSection(&client->ack_lock);
+    HANDLE ev = client->pending_acks[packet_id];
+
+    if (!ev) {
+        // create event
+        ev = CreateEvent(NULL, TRUE, FALSE, NULL);
+        if (!ev) { LeaveCriticalSection(&client->ack_lock); return -1; }
+        client->pending_acks[packet_id] = ev;
+    }
+    LeaveCriticalSection(&client->ack_lock);
+
+
+    DWORD rc = WaitForSingleObject(ev, timeout_ms);
+    if (rc == WAIT_OBJECT_0) return 0;
+    return -1;
+}
+
+static void signal_ack(baremq_client_t *client, uint16_t packet_id) {
+    if (packet_id == 0) return;
+    EnterCriticalSection(&client->ack_lock);
+    HANDLE ev = client->pending_acks[packet_id];
+    if (ev) {
+        SetEvent(ev);
+        // Close and clear to avoid reuse; callers create fresh events when waiting
+        CloseHandle(ev);
+        client->pending_acks[packet_id] = NULL;
+    }
+
+    LeaveCriticalSection(&client->ack_lock);
+}
+
+// Encode MQTT Remaining Length into buffer. Returns number of bytes written.
+static int encode_remaining_length(uint8_t *buf, size_t len) {
+    int idx = 0;
     do {
-        uint8_t digit = remaining_len % 128;
-        remaining_len /= 128;
-        if (remaining_len > 0) digit |= 0x80;
-        buffer[pos++] = digit;
-    } while (remaining_len > 0 && pos < 4);
-    return pos;
+        uint8_t encoded = len % 128;
+        len /= 128;
+        // if there are more digits to encode, set the top bit of this digit
+        if (len > 0) encoded |= 0x80;
+        buf[idx++] = encoded;
+    } while (len > 0 && idx < 4);
+
+    return idx;
+}
+
+// Initialize client
+baremq_client_t *baremq_init(const char *broker_ip, uint16_t port, const char *client_id,
+                             const char *username, const char *password, uint16_t keep_alive,
+                             size_t max_buffer_size) {
+    baremq_client_t *client = malloc(sizeof(baremq_client_t));
+    if (!client) return NULL;
+
+    client->broker_ip = strdup(broker_ip);
+    client->broker_port = port;
+    client->client_id = strdup(client_id);
+    client->username = username ? strdup(username) : NULL;
+    client->password = password ? strdup(password) : NULL;
+    client->keep_alive = keep_alive ? keep_alive : 60;
+    client->sockfd = INVALID_SOCKET;
+    client->last_ping = 0;
+    client->last_error[0] = '\0';
+    client->max_buffer_size = max_buffer_size;
+    client->iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+    // allocate receive buffer
+    client->recv_capacity = client->max_buffer_size ? client->max_buffer_size : BUFFER_SIZE;
+    client->recv_buf = (uint8_t *)malloc(client->recv_capacity);
+    client->recv_len = 0;
+    client->message_cb = NULL;
+    client->pending_acks = (HANDLE *)calloc(65536, sizeof(HANDLE));
+    client->next_packet_id = 1;
+    InitializeCriticalSection(&client->ack_lock);
+    InitializeCriticalSection(&client->recv_lock);
+    return client;
+}
+
+// Free client
+void baremq_free(baremq_client_t *client) {
+    if (client) {
+        if (client->sockfd != INVALID_SOCKET) closesocket(client->sockfd);
+        free(client->broker_ip);
+        free(client->client_id);
+        free(client->username);
+        free(client->password);
+        if (client->recv_buf) free(client->recv_buf);
+        if (client->pending_acks) {
+            for (size_t i = 0; i < 65536; ++i) {
+                if (client->pending_acks[i]) CloseHandle(client->pending_acks[i]);
+            }
+            free(client->pending_acks);
+        }
+        DeleteCriticalSection(&client->ack_lock);
+        DeleteCriticalSection(&client->recv_lock);
+        CloseHandle(client->iocp);
+        free(client);
+    }
 }
 
 // Set last error
@@ -96,737 +694,496 @@ static void set_error(baremq_client_t *client, const char *fmt, ...) {
     va_end(args);
 }
 
-// Get next packet ID
-static uint16_t get_packet_id(baremq_client_t *client) {
-    if (client->num_pending_pubacks >= MAX_PACKET_IDS) {
-        set_error(client, "Packet ID pool exhausted");
-        return 0;
-    }
-    uint16_t pid = client->packet_id_pool[client->next_packet_id_idx];
-    client->pending_pubacks[client->num_pending_pubacks++] = pid;
-    client->next_packet_id_idx = (client->next_packet_id_idx + 1) % MAX_PACKET_IDS;
-    return pid;
-}
+// Send MQTT CONNECT packet
+static int send_mqtt_connect(baremq_client_t *client) {
+    uint8_t connect_packet[BUFFER_SIZE];
+    uint8_t body[BUFFER_SIZE];
+    size_t body_len = 0;
 
-// Free packet ID
-static void free_packet_id(baremq_client_t *client, uint16_t pid) {
-    for (size_t i = 0; i < client->num_pending_pubacks; i++) {
-        if (client->pending_pubacks[i] == pid) {
-            client->pending_pubacks[i] = client->pending_pubacks[--client->num_pending_pubacks];
-            break;
-        }
-    }
-}
+    // Variable header into body buffer
+    const char *protocol_name = "MQTT";
+    // Protocol name (2-byte length MSB, LSB)
+    body[body_len++] = (uint8_t)((strlen(protocol_name) >> 8) & 0xFF);
+    body[body_len++] = (uint8_t)(strlen(protocol_name) & 0xFF);
+    memcpy(&body[body_len], protocol_name, strlen(protocol_name));
+    body_len += strlen(protocol_name);
+    // Protocol level
+    body[body_len++] = 4; // MQTT 3.1.1
 
-// Initialize client
-baremq_client_t *baremq_init(const char *broker_ip, uint16_t port, const char *client_id,
-                             const char *username, const char *password, uint16_t keep_alive,
-                             size_t max_buffer_size) {
-    baremq_client_t *client = malloc(sizeof(baremq_client_t));
-    if (!client) return NULL;
-    
-    client->broker_ip = strdup(broker_ip);
-    client->broker_port = port;
-    client->client_id = strdup(client_id);
-    client->username = username ? strdup(username) : NULL;
-    client->password = password ? strdup(password) : NULL;
-    client->keep_alive = keep_alive ? keep_alive : 60;
-    client->max_buffer_size = max_buffer_size ? max_buffer_size : 1024 * 1024; // Default 1MB
-    client->sockfd = INVALID_SOCKET;
-    client->last_ping = 0;
-    client->last_error[0] = '\0';
-    client->next_packet_id_idx = 0;
-    client->num_pending_pubacks = 0;
-    for (uint16_t i = 0; i < MAX_PACKET_IDS; i++) {
-        client->packet_id_pool[i] = i + 1; // IDs 1 to 1024
-    }
-    return client;
-}
+    // Connect flags — set clean session by default, and set username/password flags if present
+    uint8_t connect_flags = 0x02; // Clean session
+    size_t username_len = client->username ? strlen(client->username) : 0;
+    size_t password_len = client->password ? strlen(client->password) : 0;
+    if (username_len) connect_flags |= 0x80; // Username Flag
+    if (password_len) connect_flags |= 0x40; // Password Flag
+    body[body_len++] = connect_flags;
 
-// Free client
-void baremq_free(baremq_client_t *client) {
-    if (client) {
-        if (client->sockfd != INVALID_SOCKET) CLOSE_SOCKET(client->sockfd);
-        free(client->broker_ip);
-        free(client->client_id);
-        free(client->username);
-        free(client->password);
-        free(client);
-    }
-}
+    // Keep alive (2 bytes)
+    body[body_len++] = (uint8_t)((client->keep_alive >> 8) & 0xFF);
+    body[body_len++] = (uint8_t)(client->keep_alive & 0xFF);
 
-// Connect to TCP socket
-static int tcp_connect(baremq_client_t *client) {
-#ifdef _WIN32
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        set_error(client, "WSAStartup failed: %d", WSAGetLastError());
+    // Payload: Client Identifier (2-byte length + data)
+    size_t client_id_len = client->client_id ? strlen(client->client_id) : 0;
+    body[body_len++] = (uint8_t)((client_id_len >> 8) & 0xFF);
+    body[body_len++] = (uint8_t)(client_id_len & 0xFF);
+    if (client_id_len) {
+        memcpy(&body[body_len], client->client_id, client_id_len);
+        body_len += client_id_len;
+    }
+
+    // Will topic/payload would go here if used (not supported in this simple client)
+
+    // Username and Password (if present)
+    if (username_len) {
+        body[body_len++] = (uint8_t)((username_len >> 8) & 0xFF);
+        body[body_len++] = (uint8_t)(username_len & 0xFF);
+        memcpy(&body[body_len], client->username, username_len);
+        body_len += username_len;
+    }
+
+    if (password_len) {
+        body[body_len++] = (uint8_t)((password_len >> 8) & 0xFF);
+        body[body_len++] = (uint8_t)(password_len & 0xFF);
+        memcpy(&body[body_len], client->password, password_len);
+        body_len += password_len;
+    }
+
+    // Build fixed header + remaining length
+    size_t packet_len = 0;
+    connect_packet[packet_len++] = (uint8_t)(MQTT_CONNECT << 4);
+
+    // Encode remaining length into a temporary buffer
+    uint8_t rem_buf[4];
+    int rem_len_bytes = encode_remaining_length(rem_buf, body_len);
+    if (rem_len_bytes <= 0) {
+        set_error(client, "Failed to encode remaining length");
         return -1;
     }
-#endif
 
-    struct addrinfo hints, *result = NULL, *ptr = NULL;
+    // Ensure total fits
+    if (1 + rem_len_bytes + body_len > BUFFER_SIZE) {
+        set_error(client, "CONNECT packet too large");
+        return -1;
+    }
+
+    // copy remaining length
+    for (int i = 0; i < rem_len_bytes; ++i) connect_packet[packet_len++] = rem_buf[i];
+
+    // copy body
+    memcpy(&connect_packet[packet_len], body, body_len);
+    packet_len += body_len;
+
+    // Send packet using WSASend (overlapped)
+    WSABUF wsaBuf;
+    DWORD bytesSent = 0;
+    DWORD flags = 0;
+    OVERLAPPED overlapped = {0};
+
+    wsaBuf.buf = (char *)connect_packet;
+    wsaBuf.len = (ULONG)packet_len;
+
+    int result = WSASend(client->sockfd, &wsaBuf, 1, &bytesSent, flags, &overlapped, NULL);
+    if (result == SOCKET_ERROR) {
+        int error = WSAGetLastError();
+        if (error != WSA_IO_PENDING) {
+            set_error(client, "Failed to send CONNECT packet: WSAGetLastError=%d", error);
+            return -1;
+        }
+        // If IO pending, the send was queued successfully.
+    }
+
+    return 0;
+}
+
+// Connect to broker using non-blocking sockets
+int baremq_connect(baremq_client_t *client) {
+    WSADATA wsaData;
+    struct addrinfo *result = NULL, *ptr = NULL, hints;
     char port_str[6];
     int ret;
 
+    if (WSAStartup(MAKEWORD(2,2), &wsaData) != 0) {
+        set_error(client, "WSAStartup failed");
+        return -1;
+    }
+
+    snprintf(port_str, sizeof(port_str), "%u", client->broker_port);
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
 
-    snprintf(port_str, sizeof(port_str), "%u", client->broker_port);
-
     ret = getaddrinfo(client->broker_ip, port_str, &hints, &result);
     if (ret != 0) {
-        set_error(client, "getaddrinfo failed: %s", gai_strerror(ret));
-#ifdef _WIN32
+        set_error(client, "getaddrinfo: %s", gai_strerror(ret));
         WSACleanup();
-#endif
         return -1;
     }
 
-    client->sockfd = INVALID_SOCKET;
     for (ptr = result; ptr != NULL; ptr = ptr->ai_next) {
         client->sockfd = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
         if (client->sockfd == INVALID_SOCKET) continue;
 
-        if (connect(client->sockfd, ptr->ai_addr, (int)ptr->ai_addrlen) == SOCKET_ERROR) {
-            CLOSE_SOCKET(client->sockfd);
-            client->sockfd = INVALID_SOCKET;
-            continue;
-        }
-        break;
+        // Set socket to non-blocking
+        u_long mode = 1;
+        ioctlsocket(client->sockfd, FIONBIO, &mode);
+
+        if (connect(client->sockfd, ptr->ai_addr, (int)ptr->ai_addrlen) != SOCKET_ERROR || WSAGetLastError() == WSAEWOULDBLOCK) break;
+
+        closesocket(client->sockfd);
     }
 
     freeaddrinfo(result);
 
-    if (client->sockfd == INVALID_SOCKET) {
-        set_error(client, "Failed to connect to %s:%u", client->broker_ip, client->broker_port);
-#ifdef _WIN32
+    if (ptr == NULL) {
+        set_error(client, "Could not connect");
         WSACleanup();
-#endif
         return -1;
     }
 
-    return 0;
-}
+    // Associate the socket with the IO completion port
+    CreateIoCompletionPort((HANDLE)client->sockfd, client->iocp, (ULONG_PTR)client, 0);
 
-// Build MQTT CONNECT packet
-static int build_connect_packet(uint8_t *buffer, size_t buffer_size, baremq_client_t *client) {
-    size_t client_id_len = strlen(client->client_id);
-    size_t username_len = client->username ? strlen(client->client_id) : 0;
-    size_t password_len = client->password ? strlen(client->password) : 0;
-    size_t variable_header_len = 10;
-    size_t payload_len = 2 + client_id_len;
-    uint8_t connect_flags = 0;
-
-    if (username_len) {
-        payload_len += 2 + username_len;
-        connect_flags |= 0x80;
-    }
-    if (password_len) {
-        payload_len += 2 + password_len;
-        connect_flags |= 0x40;
-    }
-
-    size_t remaining_len = variable_header_len + payload_len;
-    
-    uint8_t rem_len_buf[4];
-    int rem_len_size = encode_remaining_length(rem_len_buf, remaining_len);
-    if (buffer_size < 1 + rem_len_size + remaining_len) {
-        set_error(client, "Buffer too small for CONNECT packet");
+    // Send MQTT CONNECT packet
+    if (send_mqtt_connect(client) != 0) {
         return -1;
     }
 
-    buffer[0] = (MQTT_CONNECT << 4);
-    memcpy(buffer + 1, rem_len_buf, rem_len_size);
-
-    size_t pos = 1 + rem_len_size;
-    buffer[pos++] = 0; buffer[pos++] = 4;
-    buffer[pos++] = 'M'; buffer[pos++] = 'Q';
-    buffer[pos++] = 'T'; buffer[pos++] = 'T';
-    buffer[pos++] = 4;
-    buffer[pos++] = connect_flags;
-    buffer[pos++] = (client->keep_alive >> 8) & 0xFF;
-    buffer[pos++] = client->keep_alive & 0xFF;
-
-    buffer[pos++] = (client_id_len >> 8) & 0xFF;
-    buffer[pos++] = client_id_len & 0xFF;
-    memcpy(buffer + pos, client->client_id, client_id_len);
-    pos += client_id_len;
-
-    if (username_len) {
-        buffer[pos++] = (username_len >> 8) & 0xFF;
-        buffer[pos++] = username_len & 0xFF;
-        memcpy(buffer + pos, client->username, username_len);
-        pos += username_len;
-    }
-
-    if (password_len) {
-        buffer[pos++] = (password_len >> 8) & 0xFF;
-        buffer[pos++] = password_len & 0xFF;
-        memcpy(buffer + pos, client->password, password_len);
-        pos += password_len;
-    }
-
-    return 1 + rem_len_size + remaining_len;
-}
-
-// Connect to broker
-int baremq_connect(baremq_client_t *client) {
-    if (tcp_connect(client) < 0) return -1;
-
-    uint8_t *buffer = malloc(client->max_buffer_size);
-    if (!buffer) {
-        set_error(client, "Failed to allocate CONNECT buffer");
-        return -1;
-    }
-
-    int packet_len = build_connect_packet(buffer, client->max_buffer_size, client);
-    if (packet_len < 0) {
-        free(buffer);
-        return -1;
-    }
-
-    if (send(client->sockfd, (char *)buffer, packet_len, 0) != packet_len) {
-        set_error(client, "Failed to send CONNECT packet: %d", WSAGetLastError());
-        free(buffer);
-        return -1;
-    }
-
-    uint8_t response[5];
-    int bytes_received = recv(client->sockfd, (char *)response, 5, 0);
-    fprintf(stderr, "CONNACK recv: %d bytes, error %d\n", bytes_received, WSAGetLastError());
-    if (bytes_received != 4) {
-        set_error(client, "Failed to read CONNACK: %d bytes, error %d", bytes_received, WSAGetLastError());
-        free(buffer);
-        return -1;
-    }
-
-    if ((response[0] >> 4) != MQTT_CONNACK) {
-        set_error(client, "Invalid CONNACK packet: type %d", response[0] >> 4);
-        free(buffer);
-        return -1;
-    }
-
-    switch (response[3]) {
-        case 0: break;
-        case 1: set_error(client, "Connection refused: unacceptable protocol version"); free(buffer); return -1;
-        case 2: set_error(client, "Connection refused: identifier rejected"); free(buffer); return -1;
-        case 3: set_error(client, "Connection refused: server unavailable"); free(buffer); return -1;
-        case 4: set_error(client, "Connection refused: bad username or password"); free(buffer); return -1;
-        case 5: set_error(client, "Connection refused: not authorized"); free(buffer); return -1;
-        default: set_error(client, "Connection refused: unknown error %d", response[3]); free(buffer); return -1;
-    }
-
-    free(buffer);
-    client->last_ping = GetTickCount();
-    return 0;
-}
-
-// Validate topic for wildcards
-static int validate_topic(const char *topic) {
-    size_t len = strlen(topic);
-    for (size_t i = 0; i < len; i++) {
-        if (topic[i] == '+' && ((i > 0 && topic[i-1] != '/') || (i < len-1 && topic[i+1] != '/'))) {
-            return -1;
-        }
-        if (topic[i] == '#' && i != len-1) {
-            return -1;
-        }
-    }
-    return 0;
-}
-
-// Build MQTT SUBSCRIBE packet
-static int build_subscribe_packet(uint8_t *buffer, size_t buffer_size, const char *topic, uint16_t packet_id) {
-    size_t topic_len = strlen(topic);
-    size_t variable_header_len = 2;
-    size_t payload_len = 2 + topic_len + 1;
-    size_t remaining_len = variable_header_len + payload_len;
-
-    uint8_t rem_len_buf[4];
-    int rem_len_size = encode_remaining_length(rem_len_buf, remaining_len);
-    if (buffer_size < 1 + rem_len_size + remaining_len) return -1;
-
-    buffer[0] = (MQTT_SUBSCRIBE << 4) | 2;
-    memcpy(buffer + 1, rem_len_buf, rem_len_size);
-
-    buffer[1 + rem_len_size] = (packet_id >> 8) & 0xFF;
-    buffer[2 + rem_len_size] = packet_id & 0xFF;
-
-    buffer[3 + rem_len_size] = (topic_len >> 8) & 0xFF;
-    buffer[4 + rem_len_size] = topic_len & 0xFF;
-    memcpy(buffer + 5 + rem_len_size, topic, topic_len);
-    buffer[5 + rem_len_size + topic_len] = 0;
-
-    return 1 + rem_len_size + remaining_len;
-}
-
-// Subscribe to a topic
-int baremq_sub(baremq_client_t *client, const char *topic) {
-    if (validate_topic(topic) < 0) {
-        set_error(client, "Invalid topic wildcard syntax");
-        return -1;
-    }
-
-    uint8_t *buffer = malloc(client->max_buffer_size);
-    if (!buffer) {
-        set_error(client, "Failed to allocate SUBSCRIBE buffer");
-        return -1;
-    }
-
-    int packet_len = build_subscribe_packet(buffer, client->max_buffer_size, topic, client->packet_id_pool[client->next_packet_id_idx]);
-    if (packet_len < 0) {
-        set_error(client, "Failed to build SUBSCRIBE packet");
-        free(buffer);
-        return -1;
-    }
-
-    if (send(client->sockfd, (char *)buffer, packet_len, 0) != packet_len) {
-        set_error(client, "Failed to send SUBSCRIBE packet: %d", WSAGetLastError());
-        free(buffer);
-        return -1;
-    }
-
-    uint8_t response[5];
-    int bytes_received = recv(client->sockfd, (char *)response, 5, 0);
-    fprintf(stderr, "SUBACK recv: %d bytes, error %d\n", bytes_received, WSAGetLastError());
-    if (bytes_received != 5 || (response[0] >> 4) != MQTT_SUBACK || response[4] > 2) {
-        set_error(client, "SUBACK failed: received %d bytes, type %d, return code %d", bytes_received, response[0] >> 4, response[4]);
-        free(buffer);
-        return -1;
-    }
-
-    free(buffer);
-    client->last_ping = GetTickCount();
-    return 0;
-}
-
-// Build MQTT PUBLISH packet
-static int build_publish_packet(uint8_t *buffer, size_t buffer_size, const char *topic,
-                                const char *message, size_t message_len, uint16_t packet_id, int qos) {
-    size_t topic_len = strlen(topic);
-    size_t variable_header_len = 2 + topic_len + (qos ? 2 : 0);
-    size_t payload_len = message_len;
-    size_t remaining_len = variable_header_len + payload_len;
-
-    uint8_t rem_len_buf[4];
-    int rem_len_size = encode_remaining_length(rem_len_buf, remaining_len);
-    if (buffer_size < 1 + rem_len_size + remaining_len) return -1;
-
-    buffer[0] = (MQTT_PUBLISH << 4) | (qos ? 2 : 0);
-    memcpy(buffer + 1, rem_len_buf, rem_len_size);
-
-    size_t pos = 1 + rem_len_size;
-    buffer[pos++] = (topic_len >> 8) & 0xFF;
-    buffer[pos++] = topic_len & 0xFF;
-    memcpy(buffer + pos, topic, topic_len);
-    pos += topic_len;
-
-    if (qos) {
-        buffer[pos++] = (packet_id >> 8) & 0xFF;
-        buffer[pos++] = packet_id & 0xFF;
-    }
-
-    memcpy(buffer + pos, message, message_len);
-
-    return 1 + rem_len_size + remaining_len;
-}
-
-// Read MQTT packet header (type + remaining length)
-static int read_packet_header(SOCKET sockfd, uint8_t *type, size_t *remaining_len, uint8_t *header_buf, size_t *header_len) {
-    int bytes_received = recv(sockfd, (char *)header_buf, 1, 0);
-    if (bytes_received != 1) {
-        return -1; // Error or connection closed
-    }
-    *type = header_buf[0] >> 4;
-    *header_len = 1;
-
-    // Read remaining length (1-4 bytes)
-    uint8_t len_buf[4];
-    size_t len_bytes = 0;
-    uint8_t encoded_byte;
-    do {
-        if (len_bytes >= 4) return -1; // Invalid length
-        bytes_received = recv(sockfd, (char *)&encoded_byte, 1, 0);
-        if (bytes_received != 1) return -1;
-        len_buf[len_bytes++] = encoded_byte;
-        header_buf[*header_len] = encoded_byte;
-        (*header_len)++;
-    } while (encoded_byte & 0x80);
-
-    size_t length, bytes_read;
-    if (decode_remaining_length(len_buf, &length, &bytes_read, len_bytes) < 0) {
-        return -1;
-    }
-    *remaining_len = length;
     return 0;
 }
 
 // Publish a message
 int baremq_send(baremq_client_t *client, const char *topic, const char *message, size_t message_len, int qos) {
-    if (qos != 0 && qos != 1) {
-        set_error(client, "Invalid QoS level: %d", qos);
-        return -1;
+    if (!client || client->sockfd == INVALID_SOCKET || !topic) return -1;
+
+    uint8_t body[BUFFER_SIZE];
+    size_t body_len = 0;
+
+    // Topic
+    size_t topic_len = strlen(topic);
+    if (topic_len + message_len + 10 > sizeof(body)) return -1;
+    body[body_len++] = (uint8_t)((topic_len >> 8) & 0xFF);
+    body[body_len++] = (uint8_t)(topic_len & 0xFF);
+    memcpy(&body[body_len], topic, topic_len);
+    body_len += topic_len;
+
+    uint16_t packet_id = 0;
+    if (qos == 1) {
+        packet_id = get_next_packet_id(client);
+        body[body_len++] = (uint8_t)((packet_id >> 8) & 0xFF);
+        body[body_len++] = (uint8_t)(packet_id & 0xFF);
     }
 
-    size_t total_size = 2 + strlen(topic) + (qos ? 2 : 0) + message_len + 4;
-    if (total_size > client->max_buffer_size) {
-        set_error(client, "Message size %zu exceeds max buffer size %zu", total_size, client->max_buffer_size);
-        return -1;
+    // payload
+    if (message && message_len) {
+        memcpy(&body[body_len], message, message_len);
+        body_len += message_len;
     }
 
-    uint8_t *buffer = malloc(client->max_buffer_size);
-    if (!buffer) {
-        set_error(client, "Failed to allocate PUBLISH buffer");
-        return -1;
-    }
+    // Build fixed header and remaining length
+    uint8_t packet[BUFFER_SIZE];
+    size_t p = 0;
+    uint8_t fixed = (uint8_t)(MQTT_PUBLISH << 4);
+    if (qos == 1) fixed |= (1 << 1);
+    packet[p++] = fixed;
 
-    uint16_t pid = qos ? get_packet_id(client) : 0;
-    if (qos && pid == 0) {
-        free(buffer);
-        return -1;
-    }
+    uint8_t rem[4];
+    int rem_bytes = encode_remaining_length(rem, body_len);
+    if (rem_bytes <= 0) return -1;
+    for (int i = 0; i < rem_bytes; ++i) packet[p++] = rem[i];
+    memcpy(&packet[p], body, body_len);
+    p += body_len;
 
-    int packet_len = build_publish_packet(buffer, client->max_buffer_size, topic, message, message_len, pid, qos);
-    if (packet_len < 0) {
-        set_error(client, "Failed to build PUBLISH packet");
-        if (qos) free_packet_id(client, pid);
-        free(buffer);
-        return -1;
-    }
-
-    if (send(client->sockfd, (char *)buffer, packet_len, 0) != packet_len) {
-        set_error(client, "Failed to send PUBLISH packet: %d", WSAGetLastError());
-        if (qos) free_packet_id(client, pid);
-        free(buffer);
-        return -1;
-    }
-
-    if (qos) {
-        int timeout = 10000; // 10 seconds
-        setsockopt(client->sockfd, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
-
-        uint8_t header_buf[5];
-        size_t header_len;
-        int retries = 5;
-        while (retries > 0) {
-            uint8_t packet_type;
-            size_t remaining_len;
-            if (read_packet_header(client->sockfd, &packet_type, &remaining_len, header_buf, &header_len) < 0) {
-                int err = WSAGetLastError();
-                fprintf(stderr, "Header read failed: error %d\n", err);
-#ifdef _WIN32
-                if (err == WSAECONNRESET || err == WSAETIMEDOUT) {
-                    set_error(client, "Connection issue (error %d), attempting reconnect", err);
-                    baremq_reconnect(client);
-                } else {
-                    set_error(client, "Failed to read packet header: error %d", err);
-                }
-#else
-                set_error(client, "Failed to read packet header: error %d", err);
-#endif
-                if (qos) free_packet_id(client, pid);
-                free(buffer);
-                return -1;
-            }
-
-            fprintf(stderr, "Received packet type %d, length %zu, header bytes %zu\n", packet_type, remaining_len, header_len);
-
-            if (packet_type == MQTT_PUBACK && remaining_len == 2) {
-                uint8_t puback_data[2];
-                int bytes_received = recv(client->sockfd, (char *)puback_data, 2, 0);
-                fprintf(stderr, "PUBACK data read: %d bytes, error %d\n", bytes_received, WSAGetLastError());
-                if (bytes_received != 2) {
-                    set_error(client, "Failed to read PUBACK data: %d bytes, error %d", bytes_received, WSAGetLastError());
-                    if (qos) free_packet_id(client, pid);
-                    free(buffer);
-                    return -1;
-                }
-                uint16_t received_pid = (puback_data[0] << 8) | puback_data[1];
-                if (received_pid == pid) break;
-                set_error(client, "Received PUBACK with wrong packet ID: %d, expected %d", received_pid, pid);
-                if (qos) free_packet_id(client, pid);
-                free(buffer);
-                return -1;
-            }
-
-            // Discard non-PUBACK packet
-            fprintf(stderr, "Discarding packet type %d, length %zu\n", packet_type, remaining_len);
-            if (remaining_len > client->max_buffer_size) {
-                set_error(client, "Unexpected packet too large: %zu bytes", remaining_len);
-                if (qos) free_packet_id(client, pid);
-                free(buffer);
-                return -1;
-            }
-            if (remaining_len > 0) {
-                uint8_t *discard_buf = malloc(remaining_len);
-                if (!discard_buf) {
-                    set_error(client, "Failed to allocate discard buffer");
-                    if (qos) free_packet_id(client, pid);
-                    free(buffer);
-                    return -1;
-                }
-                int bytes_received = recv(client->sockfd, (char *)discard_buf, remaining_len, 0);
-                fprintf(stderr, "Discarded packet read: %d bytes, error %d\n", bytes_received, WSAGetLastError());
-                if (bytes_received != (int)remaining_len) {
-                    set_error(client, "Failed to read discarded packet: %d bytes, error %d", bytes_received, WSAGetLastError());
-                    free(discard_buf);
-                    if (qos) free_packet_id(client, pid);
-                    free(buffer);
-                    return -1;
-                }
-                free(discard_buf);
-            }
-            retries--;
-            SLEEP(200);
+    // If QoS1, create pending event before sending to avoid races
+    if (qos == 1) {
+        EnterCriticalSection(&client->ack_lock);
+        if (client->pending_acks[packet_id] == NULL) {
+            client->pending_acks[packet_id] = CreateEvent(NULL, TRUE, FALSE, NULL);
         }
+        LeaveCriticalSection(&client->ack_lock);
+    }
 
-        if (retries == 0) {
-            set_error(client, "Failed to receive valid PUBACK after retries");
-            if (qos) free_packet_id(client, pid);
-            free(buffer);
+    WSABUF wsaBuf;
+    DWORD sent = 0;
+    DWORD flags = 0;
+    OVERLAPPED ov = {0};
+    wsaBuf.buf = (char *)packet;
+    wsaBuf.len = (ULONG)p;
+    int r = WSASend(client->sockfd, &wsaBuf, 1, &sent, flags, &ov, NULL);
+    if (r == SOCKET_ERROR) {
+        int err = WSAGetLastError();
+        if (err != WSA_IO_PENDING) {
+            set_error(client, "WSASend failed: %d", err);
             return -1;
         }
-
-        timeout = 0;
-        setsockopt(client->sockfd, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
-        free_packet_id(client, pid);
     }
 
-    free(buffer);
-    client->last_ping = GetTickCount();
+    if (qos == 1) {
+        // wait for PUBACK (timeout 5s)
+        int wait_ok = wait_for_ack(client, packet_id, 5000);
+        if (wait_ok != 0) {
+            set_error(client, "PUBACK timeout for packet id %u", packet_id);
+            return -1;
+        }
+    }
+
     return 0;
 }
 
-// Send PINGREQ and check PINGRESP
-static int ping(baremq_client_t *client) {
-    int timeout = 3000;
-    setsockopt(client->sockfd, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
+// Subscribe to a topic (blocking until SUBACK or timeout)
+int baremq_sub(baremq_client_t *client, const char *topic) {
+    if (!client || client->sockfd == INVALID_SOCKET || !topic) return -1;
+    uint8_t body[BUFFER_SIZE];
+    size_t body_len = 0;
+    uint16_t packet_id = get_next_packet_id(client);
+    // packet id
+    body[body_len++] = (uint8_t)((packet_id >> 8) & 0xFF);
+    body[body_len++] = (uint8_t)(packet_id & 0xFF);
+    // topic filter
+    size_t topic_len = strlen(topic);
+    body[body_len++] = (uint8_t)((topic_len >> 8) & 0xFF);
+    body[body_len++] = (uint8_t)(topic_len & 0xFF);
+    memcpy(&body[body_len], topic, topic_len);
+    body_len += topic_len;
+    // requested QoS = 0
+    body[body_len++] = 0;
 
-    uint8_t pingreq[2] = { (MQTT_PINGREQ << 4), 0 };
-    if (send(client->sockfd, (char *)pingreq, 2, 0) != 2) {
-        set_error(client, "Failed to send PINGREQ: %d", WSAGetLastError());
+    uint8_t packet[BUFFER_SIZE];
+    size_t p = 0;
+    packet[p++] = (uint8_t)((MQTT_SUBSCRIBE << 4) | 0x02); // SUBSCRIBE with reserved bits
+    uint8_t rem[4];
+    int rem_bytes = encode_remaining_length(rem, body_len);
+    if (rem_bytes <= 0) return -1;
+    for (int i = 0; i < rem_bytes; ++i) packet[p++] = rem[i];
+    memcpy(&packet[p], body, body_len);
+    p += body_len;
+
+    // create pending ack event
+    EnterCriticalSection(&client->ack_lock);
+    if (client->pending_acks[packet_id] == NULL) client->pending_acks[packet_id] = CreateEvent(NULL, TRUE, FALSE, NULL);
+    LeaveCriticalSection(&client->ack_lock);
+
+    WSABUF wsaBuf;
+    DWORD sent = 0;
+    DWORD flags = 0;
+    OVERLAPPED ov = {0};
+    wsaBuf.buf = (char *)packet;
+    wsaBuf.len = (ULONG)p;
+    int r = WSASend(client->sockfd, &wsaBuf, 1, &sent, flags, &ov, NULL);
+    if (r == SOCKET_ERROR) {
+        int err = WSAGetLastError();
+        if (err != WSA_IO_PENDING) {
+            set_error(client, "WSASend SUBSCRIBE failed: %d", err);
+            return -1;
+        }
+    }
+
+    // wait for SUBACK (timeout 5s)
+    int wait_ok = wait_for_ack(client, packet_id, 5000);
+    if (wait_ok != 0) {
+        set_error(client, "SUBACK timeout for packet id %u", packet_id);
         return -1;
     }
-
-    uint8_t header_buf[5];
-    size_t header_len;
-    while (1) {
-        uint8_t packet_type;
-        size_t remaining_len;
-        if (read_packet_header(client->sockfd, &packet_type, &remaining_len, header_buf, &header_len) < 0) {
-            set_error(client, "Failed to read PINGRESP header: error %d", WSAGetLastError());
-            return -1;
-        }
-
-        fprintf(stderr, "PINGRESP packet type %d, length %zu, header bytes %zu\n", packet_type, remaining_len, header_len);
-
-        if (packet_type == MQTT_PINGRESP && remaining_len == 0) break;
-
-        // Discard non-PINGRESP packet
-        fprintf(stderr, "Discarding ping packet type %d, length %zu\n", packet_type, remaining_len);
-        if (remaining_len > sizeof(header_buf)) {
-            set_error(client, "Packet too large for ping buffer: %zu bytes", remaining_len);
-            return -1;
-        }
-        if (remaining_len > 0) {
-            int bytes_received = recv(client->sockfd, (char *)header_buf, remaining_len, 0);
-            fprintf(stderr, "Discarded ping packet read: %d bytes, error %d\n", bytes_received, WSAGetLastError());
-            if (bytes_received != (int)remaining_len) {
-                set_error(client, "Failed to read discarded ping packet: %d", WSAGetLastError());
-                return -1;
-            }
-        }
-    }
-
-    timeout = 0;
-    setsockopt(client->sockfd, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
-
-    client->last_ping = GetTickCount();
     return 0;
 }
 
-// Receive messages with callback
+// Receive loop: set callback and run event loop (blocks)
 int baremq_recv(baremq_client_t *client, baremq_message_callback callback) {
-    printf("Press 'q' to quit\n");
-    while (1) {
-#ifdef _WIN32
-        if (_kbhit()) {
-            if (_getch() == 'q') break;
-        }
-#else
-        struct termios oldt, newt;
-        tcgetattr(STDIN_FILENO, &oldt);
-        newt = oldt;
-        newt.c_lflag &= ~(ICANON | ECHO);
-        tcsetattr(STDIN_FILENO, TCSANOW, &newt);
-        fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);
-        int ch = getchar();
-        tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
-        if (ch == 'q') break;
-#endif
-
-        fd_set read_fds;
-        FD_ZERO(&read_fds);
-        FD_SET(client->sockfd, &read_fds);
-        struct timeval timeout = { .tv_sec = 1, .tv_usec = 0 };
-
-        int select_result = select(client->sockfd + 1, &read_fds, NULL, NULL, &timeout);
-        if (select_result == SOCKET_ERROR) {
-            set_error(client, "Select failed: %d", WSAGetLastError());
-            baremq_reconnect(client);
-            continue;
-        }
-
-        if (GetTickCount() - client->last_ping >= client->keep_alive * 1000) {
-            if (ping(client) < 0) {
-                baremq_reconnect(client);
-                continue;
-            }
-        }
-
-        if (select_result == 0) continue;
-
-        uint8_t header_buf[5];
-        size_t header_len;
-        uint8_t packet_type;
-        size_t remaining_len;
-        if (read_packet_header(client->sockfd, &packet_type, &remaining_len, header_buf, &header_len) < 0) {
-            set_error(client, "Failed to read PUBLISH header: error %d", WSAGetLastError());
-            baremq_reconnect(client);
-            continue;
-        }
-
-        fprintf(stderr, "PUBLISH packet type %d, length %zu, header bytes %zu\n", packet_type, remaining_len, header_len);
-
-        if (packet_type == MQTT_PUBACK) {
-            if (remaining_len != 2) {
-                fprintf(stderr, "Invalid PUBACK length: %zu\n", remaining_len);
-                continue;
-            }
-            uint8_t puback_data[2];
-            int bytes_received = recv(client->sockfd, (char *)puback_data, 2, 0);
-            fprintf(stderr, "PUBACK data read: %d bytes, error %d\n", bytes_received, WSAGetLastError());
-            if (bytes_received != 2) continue;
-            uint16_t pid = (puback_data[0] << 8) | puback_data[1];
-            free_packet_id(client, pid);
-            continue;
-        }
-
-        if (packet_type != MQTT_PUBLISH) {
-            fprintf(stderr, "Skipping non-PUBLISH packet type %d, length %zu\n", packet_type, remaining_len);
-            if (remaining_len > client->max_buffer_size) {
-                set_error(client, "Non-PUBLISH packet too large: %zu bytes", remaining_len);
-                continue;
-            }
-            if (remaining_len > 0) {
-                uint8_t *discard_buf = malloc(remaining_len);
-                if (!discard_buf) {
-                    set_error(client, "Failed to allocate discard buffer");
-                    continue;
-                }
-                int bytes_received = recv(client->sockfd, (char *)discard_buf, remaining_len, 0);
-                fprintf(stderr, "Discarded packet read: %d bytes, error %d\n", bytes_received, WSAGetLastError());
-                if (bytes_received != (int)remaining_len) {
-                    free(discard_buf);
-                    continue;
-                }
-                free(discard_buf);
-            }
-            continue;
-        }
-
-        uint8_t *buffer = malloc(client->max_buffer_size);
-        if (!buffer) {
-            set_error(client, "Failed to allocate RECEIVE buffer");
-            continue;
-        }
-
-        if (remaining_len > client->max_buffer_size - 2) {
-            set_error(client, "Message size %zu exceeds max buffer size %zu", remaining_len, client->max_buffer_size);
-            size_t to_read = remaining_len;
-            while (to_read > 0) {
-                size_t chunk = to_read < sizeof(header_buf) ? to_read : sizeof(header_buf);
-                int bytes_received = recv(client->sockfd, (char *)header_buf, chunk, 0);
-                fprintf(stderr, "Draining large packet: %d bytes, error %d\n", bytes_received, WSAGetLastError());
-                if (bytes_received <= 0) break;
-                to_read -= bytes_received;
-            }
-            free(buffer);
-            continue;
-        }
-
-        int bytes_received = recv(client->sockfd, (char *)buffer, remaining_len, 0);
-        fprintf(stderr, "PUBLISH payload read: %d bytes, error %d\n", bytes_received, WSAGetLastError());
-        if (bytes_received != (int)remaining_len) {
-            set_error(client, "Failed to read PUBLISH packet: %d bytes, error %d", bytes_received, WSAGetLastError());
-            free(buffer);
-            continue;
-        }
-
-        uint16_t topic_len = (buffer[0] << 8) | buffer[1];
-        char *topic = malloc(topic_len + 1);
-        if (!topic) {
-            free(buffer);
-            continue;
-        }
-        memcpy(topic, buffer + 2, topic_len);
-        topic[topic_len] = '\0';
-
-        size_t message_len = remaining_len - 2 - topic_len;
-        char *message = malloc(message_len + 1);
-        if (!message) {
-            free(topic);
-            free(buffer);
-            continue;
-        }
-        memcpy(message, buffer + 2 + topic_len, message_len);
-        message[message_len] = '\0';
-
-        callback(topic, message, message_len);
-
-        free(topic);
-        free(message);
-        free(buffer);
-        client->last_ping = GetTickCount();
-    }
+    if (!client) return -1;
+    client->message_cb = callback;
+    baremq_event_loop(client);
     return 0;
 }
 
-// Reconnect on disconnection
+// Reconnect: close socket and attempt to reconnect
 int baremq_reconnect(baremq_client_t *client) {
-    CLOSE_SOCKET(client->sockfd);
-    client->sockfd = INVALID_SOCKET;
-
-    int retries = 0;
-    int delay = 1000;
-    while (retries < 5) {
-        if (baremq_connect(client) == 0) {
-            baremq_sub(client, "soulia/+/commands");
-            return 0;
-        }
-        SLEEP(delay);
-        delay *= 2;
-        if (delay > 60000) delay = 60000;
-        retries++;
+    if (!client) return -1;
+    if (client->sockfd != INVALID_SOCKET) {
+        closesocket(client->sockfd);
+        client->sockfd = INVALID_SOCKET;
     }
-
-    set_error(client, "Reconnect failed after %d attempts", retries);
-    return -1;
+    WSACleanup();
+    // brief sleep
+    Sleep(100);
+    return baremq_connect(client);
 }
 
 // Disconnect gracefully
 int baremq_disconnect(baremq_client_t *client) {
     uint8_t buffer[2] = { (MQTT_DISCONNECT << 4), 0 };
-    send(client->sockfd, (char *)buffer, 2, 0);
-    CLOSE_SOCKET(client->sockfd);
+    send(client->sockfd, buffer, 2, 0);
+    closesocket(client->sockfd);
     client->sockfd = INVALID_SOCKET;
+    WSACleanup();
     return 0;
 }
 
 // Get last error message
 const char *baremq_get_error(baremq_client_t *client) {
     return client->last_error;
+}
+
+// Additional functions for handling MQTT packets, subscribing, publishing, etc., would be implemented here.
+
+// Structure to hold OVERLAPPED data and buffer
+struct IOData {
+    OVERLAPPED overlapped;
+    WSABUF buffer;
+    char data[BUFFER_SIZE];
+};
+
+// Main event loop using IO Completion Ports
+void baremq_event_loop(baremq_client_t *client) {
+    DWORD bytesTransferred;
+    ULONG_PTR completionKey;
+    LPOVERLAPPED overlapped;
+    struct IOData *ioData;
+    DWORD flags = 0;
+
+    // Allocate IOData structure
+    ioData = (struct IOData *)malloc(sizeof(struct IOData));
+    if (!ioData) {
+        set_error(client, "Failed to allocate IOData");
+        return;
+    }
+    memset(ioData, 0, sizeof(struct IOData));
+    ioData->buffer.buf = ioData->data;
+    ioData->buffer.len = BUFFER_SIZE;
+
+    // Post initial WSARecv
+    if (WSARecv(client->sockfd, &ioData->buffer, 1, NULL, &flags, &ioData->overlapped, NULL) == SOCKET_ERROR) {
+        if (WSAGetLastError() != WSA_IO_PENDING) {
+            set_error(client, "WSARecv failed");
+            free(ioData);
+            return;
+        }
+    }
+
+    while (GetQueuedCompletionStatus(client->iocp, &bytesTransferred, &completionKey, &overlapped, INFINITE)) {
+        ioData = (struct IOData *)overlapped;
+
+        if (!ioData) continue;
+
+        if (bytesTransferred == 0) {
+            set_error(client, "Connection closed by peer");
+            free(ioData);
+            return;
+        }
+
+        // Append received bytes into client's recv buffer
+        EnterCriticalSection(&client->recv_lock);
+        if (client->recv_len + bytesTransferred > client->recv_capacity) {
+            // try to grow buffer up to a reasonable max
+            size_t newcap = client->recv_capacity * 2;
+            if (newcap < client->recv_len + bytesTransferred) newcap = client->recv_len + bytesTransferred;
+            if (client->max_buffer_size && newcap > client->max_buffer_size) {
+                set_error(client, "Receive buffer overflow");
+                LeaveCriticalSection(&client->recv_lock);
+                free(ioData);
+                return;
+            }
+            uint8_t *nb = (uint8_t *)realloc(client->recv_buf, newcap);
+            if (!nb) {
+                set_error(client, "Failed to expand recv buffer");
+                LeaveCriticalSection(&client->recv_lock);
+                free(ioData);
+                return;
+            }
+            client->recv_buf = nb;
+            client->recv_capacity = newcap;
+        }
+        memcpy(client->recv_buf + client->recv_len, ioData->data, bytesTransferred);
+        client->recv_len += bytesTransferred;
+        LeaveCriticalSection(&client->recv_lock);
+
+        // Try to parse as many full MQTT packets as possible
+        while (1) {
+            EnterCriticalSection(&client->recv_lock);
+            if (client->recv_len < 2) { LeaveCriticalSection(&client->recv_lock); break; }
+            size_t remaining_len = 0;
+            int rem_len_bytes = 0;
+            int dr = decode_remaining_length(client->recv_buf + 1, client->recv_len - 1, &remaining_len, &rem_len_bytes);
+            if (dr == 1) { LeaveCriticalSection(&client->recv_lock); break; } // need more bytes
+            if (dr == -1) { set_error(client, "Malformed remaining length"); LeaveCriticalSection(&client->recv_lock); free(ioData); return; }
+
+            size_t total_packet_len = 1 + rem_len_bytes + remaining_len;
+            if (client->recv_len < total_packet_len) { LeaveCriticalSection(&client->recv_lock); break; }
+
+            // We have a full packet at client->recv_buf[0..total_packet_len-1]
+            uint8_t *pkt = client->recv_buf;
+            uint8_t packet_type = pkt[0] >> 4;
+            size_t var_header_idx = 1 + rem_len_bytes;
+
+            if (packet_type == MQTT_PUBACK) {
+                if (remaining_len >= 2) {
+                    uint16_t pid = (uint16_t)(pkt[var_header_idx] << 8) | pkt[var_header_idx + 1];
+                    signal_ack(client, pid);
+                }
+            } else if (packet_type == MQTT_SUBACK) {
+                if (remaining_len >= 2) {
+                    uint16_t pid = (uint16_t)(pkt[var_header_idx] << 8) | pkt[var_header_idx + 1];
+                    signal_ack(client, pid);
+                }
+            } else if (packet_type == MQTT_PINGRESP) {
+                client->last_ping = GetTickCount();
+            } else if (packet_type == MQTT_PUBLISH) {
+                // parse topic
+                if (var_header_idx + 2 > total_packet_len) {
+                    // malformed
+                } else {
+                    uint16_t topic_len = (uint16_t)(pkt[var_header_idx] << 8) | pkt[var_header_idx + 1];
+                    size_t idx = var_header_idx + 2;
+                    if (idx + topic_len > total_packet_len) {
+                        // malformed
+                    } else {
+                        char *topic_buf = (char *)malloc(topic_len + 1);
+                        memcpy(topic_buf, &pkt[idx], topic_len);
+                        topic_buf[topic_len] = '\0';
+                        idx += topic_len;
+                        int qos = (pkt[0] >> 1) & 0x03;
+                        uint16_t pid = 0;
+                        if (qos > 0) {
+                            if (idx + 2 <= total_packet_len) {
+                                pid = (uint16_t)(pkt[idx] << 8) | pkt[idx + 1];
+                                idx += 2;
+                            }
+                        }
+                        size_t payload_len = total_packet_len - idx;
+                        const char *payload_ptr = (const char *)&pkt[idx];
+                        if (client->message_cb) {
+                            client->message_cb(topic_buf, payload_ptr, payload_len);
+                        }
+                        free(topic_buf);
+                        // If QoS1, send PUBACK
+                        if (qos == 1 && pid != 0) {
+                            uint8_t ack_pkt[4];
+                            ack_pkt[0] = (MQTT_PUBACK << 4);
+                            ack_pkt[1] = 2; // remaining length
+                            ack_pkt[2] = (uint8_t)((pid >> 8) & 0xFF);
+                            ack_pkt[3] = (uint8_t)(pid & 0xFF);
+                            send(client->sockfd, (char *)ack_pkt, 4, 0);
+                        }
+                    }
+                }
+            }
+
+            // remove processed packet from buffer
+            size_t remaining = client->recv_len - total_packet_len;
+            if (remaining > 0) memmove(client->recv_buf, client->recv_buf + total_packet_len, remaining);
+            client->recv_len = remaining;
+            LeaveCriticalSection(&client->recv_lock);
+        }
+
+        // Re-post WSARecv for the next data
+        memset(&ioData->overlapped, 0, sizeof(OVERLAPPED));
+        if (WSARecv(client->sockfd, &ioData->buffer, 1, NULL, &flags, &ioData->overlapped, NULL) == SOCKET_ERROR) {
+            if (WSAGetLastError() != WSA_IO_PENDING) {
+                set_error(client, "WSARecv failed");
+                free(ioData);
+                return;
+            }
+        }
+    }
+
+    free(ioData);
 }
